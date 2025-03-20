@@ -149,26 +149,20 @@ var currentStation string
 var currentFileName string
 var ffmpegCmd *exec.Cmd
 var recording bool
-var songFinished bool
 var mu sync.Mutex
 
-func stopRecording(interrupted bool) {
+func stopRecording(deleteFile bool) {
     mu.Lock()
     defer mu.Unlock()
     if ffmpegCmd != nil && recording {
         fmt.Println("Stopping current recording")
         ffmpegCmd.Process.Kill()
-        // Only remove if interrupted AND song didn't finish naturally
-        if interrupted && !songFinished && currentFileName != "" {
+        if deleteFile && currentFileName != "" {
             fmt.Printf("Removing incomplete file: %s\n", currentFileName)
             os.Remove(currentFileName)
         }
         recording = false
         ffmpegCmd = nil
-    }
-    // Reset songFinished only if interrupted, not on natural finish
-    if interrupted {
-        songFinished = false
     }
 }
 
@@ -201,7 +195,7 @@ func RunPianotrap(cfg Config) error {
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     go func() {
         <-sigChan
-        stopRecording(true) // Interrupted by Ctrl+C
+        stopRecording(true) // Delete on Ctrl+C
         pianobarCmd.Process.Kill()
         if termState != nil {
             term.Restore(int(os.Stdin.Fd()), termState)
@@ -215,7 +209,7 @@ func RunPianotrap(cfg Config) error {
         fmt.Println(line)
 
         if strings.Contains(line, "|>  Station \"") {
-            stopRecording(true) // Interrupted by station change
+            stopRecording(true) // Delete on station change
             station := strings.Split(line, "|>  Station \"")[1]
             station = strings.TrimSuffix(station, "\"")
             if idx := strings.Index(station, " ("); idx != -1 {
@@ -232,7 +226,7 @@ func RunPianotrap(cfg Config) error {
         }
 
         if strings.Contains(line, "|> ") && strings.Contains(line, " by ") && strings.Contains(line, " on ") {
-            stopRecording(true) // Interrupted by new song (could be a skip)
+            stopRecording(false) // Don’t delete on natural song change
             parts := strings.SplitN(line, " by ", 2)
             songTitle := strings.TrimPrefix(parts[0], "|> ")
             artistAndRest := strings.SplitN(parts[1], " on ", 2)
@@ -244,22 +238,28 @@ func RunPianotrap(cfg Config) error {
             fmt.Printf("Song detected - Starting to save: %s\n", currentFileName)
             go saveSong(cfg, currentFileName, monitorSource)
             recording = true
-            songFinished = false
         }
 
         if strings.HasPrefix(line, "SONGFINISH") && ffmpegCmd != nil {
             fmt.Println("Song finished, stopping capture")
-            mu.Lock()
-            songFinished = true // Mark as finished before stopping
-            mu.Unlock()
-            stopRecording(false) // Natural finish, keep file
+            stopRecording(false) // Keep file on natural finish
+        }
+
+        // Detect skip ('n') or pause ('p') from user input prompt
+        if strings.Contains(line, "[?]") && (strings.Contains(line, "n") || strings.Contains(line, "p")) {
+            stopRecording(true) // Delete on skip or pause
+        }
+
+        // Detect connection issues
+        if strings.Contains(line, "(i) Network error") || strings.Contains(line, "Connection lost") {
+            stopRecording(true) // Delete on connection issues
         }
     }
 
     if err := pianobarCmd.Wait(); err != nil {
         fmt.Fprintf(os.Stderr, "Pianobar exited: %v\n", err)
     }
-    stopRecording(true) // Interrupted by exit
+    stopRecording(true) // Delete on exit (e.g., 'q')
     if termState != nil {
         term.Restore(int(os.Stdin.Fd()), termState)
     }
