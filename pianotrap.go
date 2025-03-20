@@ -13,6 +13,7 @@ import (
     "syscall"
     "time"
 
+    "github.com/creack/pty"
     "golang.org/x/term"
 )
 
@@ -22,8 +23,9 @@ const (
     configFileName    = "config"
     pianobarConfigDir = ".config/pianobar"
     eventCmdFileName  = "eventcmd.sh"
-    silenceThreshold  = 15 * time.Second // Longer threshold
-    minRecordTime     = 30 * time.Second // Minimum time before silence check
+    silenceThreshold  = 15 * time.Second
+    minRecordTime     = 30 * time.Second
+    timeThreshold     = 5 * time.Second // Allow 5s leeway for "complete" songs
 )
 
 type Config struct {
@@ -152,15 +154,34 @@ var currentStation string
 var currentFileName string
 var ffmpegCmd *exec.Cmd
 var recording bool
+var remainingTime time.Duration
+var totalDuration time.Duration
 var mu sync.Mutex
+
+// parseTime converts "MM:SS" to time.Duration
+func parseTime(timeStr string) (time.Duration, error) {
+    parts := strings.Split(timeStr, ":")
+    if len(parts) != 2 {
+        return 0, fmt.Errorf("invalid time format: %s", timeStr)
+    }
+    minutes, err := time.ParseDuration(parts[0] + "m")
+    if err != nil {
+        return 0, fmt.Errorf("invalid minutes: %s", parts[0])
+    }
+    seconds, err := time.ParseDuration(parts[1] + "s")
+    if err != nil {
+        return 0, fmt.Errorf("invalid seconds: %s", parts[1])
+    }
+    return minutes + seconds, nil
+}
 
 func stopRecording(deleteFile bool) {
     mu.Lock()
     defer mu.Unlock()
     if ffmpegCmd != nil && recording {
         fmt.Println("Stopping current recording")
-        ffmpegCmd.Process.Signal(syscall.SIGTERM) // Try graceful stop
-        time.Sleep(500 * time.Millisecond)        // Give it a moment
+        ffmpegCmd.Process.Signal(syscall.SIGTERM)
+        time.Sleep(500 * time.Millisecond)
         if err := ffmpegCmd.Process.Kill(); err != nil {
             fmt.Fprintf(os.Stderr, "Warning: failed to kill ffmpeg: %v\n", err)
         }
@@ -171,6 +192,31 @@ func stopRecording(deleteFile bool) {
         recording = false
         ffmpegCmd = nil
     }
+    remainingTime = 0
+    totalDuration = 0
+}
+
+// splitLines splits on either \r or \n to handle Pianobar's output
+func splitLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+    if atEOF && len(data) == 0 {
+        return 0, nil, nil
+    }
+    // Look for \r or \n
+    for i := 0; i < len(data); i++ {
+        if data[i] == '\r' || data[i] == '\n' {
+            return i + 1, data[:i], nil
+        }
+    }
+    if atEOF {
+        return len(data), data, nil
+    }
+    return 0, nil, nil
+}
+
+// stripANSI removes ANSI escape codes from a string
+func stripANSI(s string) string {
+    re := regexp.MustCompile(`\033\[[0-9;]*[a-zA-Z]`)
+    return re.ReplaceAllString(s, "")
 }
 
 func RunPianotrap(cfg Config) error {
@@ -181,23 +227,70 @@ func RunPianotrap(cfg Config) error {
     }
     fmt.Printf("Using PulseAudio monitor source: %s\n", monitorSource)
 
+    // Start Pianobar in a PTY
     pianobarCmd := exec.Command("pianobar")
-    pianobarOut, err := pianobarCmd.StdoutPipe()
+    ptyFile, err := pty.Start(pianobarCmd)
     if err != nil {
-        return fmt.Errorf("error setting up pianobar stdout: %v", err)
+        return fmt.Errorf("error starting pianobar in PTY: %v", err)
     }
-    pianobarCmd.Stdin = os.Stdin
-    pianobarCmd.Stderr = os.Stderr
+    defer ptyFile.Close()
 
     termState, err := term.GetState(int(os.Stdin.Fd()))
     if err != nil {
         fmt.Fprintf(os.Stderr, "Warning: could not save terminal state: %v\n", err)
     }
 
-    if err := pianobarCmd.Start(); err != nil {
-        return fmt.Errorf("error starting pianobar: %v", err)
+    // Set the terminal to raw mode to pass input directly
+    oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Warning: could not set terminal to raw mode: %v\n", err)
+    } else {
+        defer term.Restore(int(os.Stdin.Fd()), oldState)
     }
 
+    // Send 'i' to toggle song info after Pianobar starts
+    go func() {
+        time.Sleep(5 * time.Second) // Wait for Pianobar to initialize
+        if _, err := ptyFile.Write([]byte("i\n")); err != nil {
+            fmt.Fprintf(os.Stderr, "Error sending 'i' to pianobar: %v\n", err)
+        }
+    }()
+
+    // Channel to signal when Pianobar exits
+    done := make(chan struct{})
+    go func() {
+        if err := pianobarCmd.Wait(); err != nil {
+            fmt.Fprintf(os.Stderr, "Pianobar exited with error: %v\n", err)
+        }
+        close(done)
+    }()
+
+    // Handle input from stdin to PTY
+    inputDone := make(chan struct{})
+    go func() {
+        defer close(inputDone)
+        buf := make([]byte, 1024)
+        for {
+            select {
+            case <-done:
+                return
+            default:
+                n, err := os.Stdin.Read(buf)
+                if err != nil {
+                    if err.Error() != "EOF" {
+                        fmt.Fprintf(os.Stderr, "Error reading from stdin: %v\n", err)
+                    }
+                    return
+                }
+                if _, err := ptyFile.Write(buf[:n]); err != nil {
+                    fmt.Fprintf(os.Stderr, "Error writing to PTY: %v\n", err)
+                    return
+                }
+            }
+        }
+    }()
+
+    // Handle signals without immediately exiting
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     go func() {
@@ -205,66 +298,129 @@ func RunPianotrap(cfg Config) error {
         if termState != nil {
             term.Restore(int(os.Stdin.Fd()), termState)
         }
-        stopRecording(true) // Delete on Ctrl+C
+        stopRecording(true)
+        pianobarCmd.Process.Signal(syscall.SIGTERM)
+        time.Sleep(500 * time.Millisecond)
         pianobarCmd.Process.Kill()
-        os.Exit(0) // Clean exit
+        ptyFile.Close()
     }()
 
-    scanner := bufio.NewScanner(pianobarOut)
-    for scanner.Scan() {
-        line := scanner.Text()
-        fmt.Println(line)
+    // Regex to match countdown like "#   -MM:SS/MM:SS"
+    countdownRe := regexp.MustCompile(`#\s+-(?:(\d+):)?(\d+):(\d+)/(\d+):(\d+)`)
 
-        if strings.Contains(line, "|>  Station \"") {
-            stopRecording(true) // Delete on station change
-            station := strings.Split(line, "|>  Station \"")[1]
-            station = strings.TrimSuffix(station, "\"")
-            if idx := strings.Index(station, " ("); idx != -1 {
-                station = station[:idx]
+    // Use a scanner with a custom SplitFunc to handle \r and \n
+    scanner := bufio.NewScanner(ptyFile)
+    scanner.Split(splitLines)
+
+    var lastLine string
+loop:
+    for {
+        select {
+        case <-done:
+            // Pianobar has exited, break the loop
+            break loop
+        case <-time.After(100 * time.Millisecond):
+            // Periodically check for new output
+            if scanner.Scan() {
+                line := stripANSI(scanner.Text())
+                if line == "" {
+                    continue
+                }
+
+                // If the line starts with '#', it's a countdown update, overwrite the last line
+                if strings.HasPrefix(line, "#") {
+                    fmt.Printf("\r%-80s", line) // Overwrite the line
+                    lastLine = line
+                } else {
+                    // For non-countdown lines, print a newline if there was a countdown before
+                    if lastLine != "" && strings.HasPrefix(lastLine, "#") {
+                        fmt.Println()
+                    }
+                    fmt.Println(line)
+                    lastLine = line
+                }
+
+                // Parse countdown timer
+                if matches := countdownRe.FindStringSubmatch(line); matches != nil {
+                    remainingStr := fmt.Sprintf("%s:%s", matches[2], matches[3])
+                    if matches[1] != "" {
+                        remainingStr = fmt.Sprintf("%s:%s", matches[1], matches[2])
+                    }
+                    totalStr := fmt.Sprintf("%s:%s", matches[4], matches[5])
+                    remaining, err := parseTime(remainingStr)
+                    if err != nil {
+                        fmt.Fprintf(os.Stderr, "Error parsing remaining time: %v\n", err)
+                        continue
+                    }
+                    total, err := parseTime(totalStr)
+                    if err != nil {
+                        fmt.Fprintf(os.Stderr, "Error parsing total time: %v\n", err)
+                        continue
+                    }
+                    mu.Lock()
+                    remainingTime = remaining
+                    totalDuration = total
+                    mu.Unlock()
+                }
+
+                if strings.Contains(line, "|>  Station \"") {
+                    station := strings.Split(line, "|>  Station \"")[1]
+                    station = strings.TrimSuffix(station, "\"")
+                    if idx := strings.Index(station, " ("); idx != -1 {
+                        station = station[:idx]
+                    }
+                    newStation := sanitizeFileName(station)
+                    // Only stop recording if the station has actually changed
+                    if newStation != currentStation {
+                        stopRecording(true) // Delete on station change
+                        currentStation = newStation
+                        stationDir := filepath.Join(cfg.SaveDir, currentStation)
+                        if err := os.MkdirAll(stationDir, 0755); err != nil {
+                            fmt.Fprintf(os.Stderr, "Failed to create station dir %s: %v\n", stationDir, err)
+                        } else {
+                            fmt.Printf("Created station directory: %s\n", stationDir)
+                        }
+                        fmt.Printf("Switched to station: %s\n", currentStation)
+                    }
+                }
+
+                if strings.Contains(line, "|> ") && strings.Contains(line, " by ") && strings.Contains(line, " on ") {
+                    // If recording and remaining time is significant, assume skip
+                    mu.Lock()
+                    // Only delete if we have a countdown; otherwise, assume incomplete
+                    deleteFile := recording && totalDuration > 0 && remainingTime > timeThreshold
+                    mu.Unlock()
+                    stopRecording(deleteFile)
+                    parts := strings.SplitN(line, " by ", 2)
+                    songTitle := strings.TrimPrefix(parts[0], "|> ")
+                    artistAndRest := strings.SplitN(parts[1], " on ", 2)
+                    artist := artistAndRest[0]
+                    if currentStation == "" {
+                        currentStation = "Unknown Station"
+                    }
+                    currentFileName = filepath.Join(cfg.SaveDir, currentStation, sanitizeFileName(fmt.Sprintf("%s - %s.mp3", songTitle, artist)))
+                    fmt.Printf("Song detected - Starting to save: %s\n", currentFileName)
+                    go saveSong(cfg, currentFileName, monitorSource)
+                    recording = true
+                }
+
+                if strings.HasPrefix(line, "SONGFINISH") && ffmpegCmd != nil {
+                    fmt.Println("Song finished, stopping capture")
+                    stopRecording(false)
+                }
+
+                if strings.Contains(line, "(i) Network error") || strings.Contains(line, "Connection lost") {
+                    stopRecording(true)
+                }
+            } else if err := scanner.Err(); err != nil {
+                fmt.Fprintf(os.Stderr, "Error reading PTY output: %v\n", err)
+                break loop
             }
-            currentStation = sanitizeFileName(station)
-            stationDir := filepath.Join(cfg.SaveDir, currentStation)
-            if err := os.MkdirAll(stationDir, 0755); err != nil {
-                fmt.Fprintf(os.Stderr, "Failed to create station dir %s: %v\n", stationDir, err)
-            } else {
-                fmt.Printf("Created station directory: %s\n", stationDir)
-            }
-            fmt.Printf("Switched to station: %s\n", currentStation)
-        }
-
-        if strings.Contains(line, "|> ") && strings.Contains(line, " by ") && strings.Contains(line, " on ") {
-            stopRecording(false) // Don’t delete on natural song change
-            parts := strings.SplitN(line, " by ", 2)
-            songTitle := strings.TrimPrefix(parts[0], "|> ")
-            artistAndRest := strings.SplitN(parts[1], " on ", 2)
-            artist := artistAndRest[0]
-            if currentStation == "" {
-                currentStation = "Unknown Station"
-            }
-            currentFileName = filepath.Join(cfg.SaveDir, currentStation, sanitizeFileName(fmt.Sprintf("%s - %s.mp3", songTitle, artist)))
-            fmt.Printf("Song detected - Starting to save: %s\n", currentFileName)
-            go saveSong(cfg, currentFileName, monitorSource)
-            recording = true
-        }
-
-        if strings.HasPrefix(line, "SONGFINISH") && ffmpegCmd != nil {
-            fmt.Println("Song finished, stopping capture")
-            stopRecording(false) // Keep file on natural finish
-        }
-
-        if strings.Contains(line, "[?]") && (strings.Contains(line, "n") || strings.Contains(line, "p")) {
-            stopRecording(true) // Delete on skip or pause
-        }
-
-        if strings.Contains(line, "(i) Network error") || strings.Contains(line, "Connection lost") {
-            stopRecording(true) // Delete on connection issues
         }
     }
 
-    if err := pianobarCmd.Wait(); err != nil {
-        fmt.Fprintf(os.Stderr, "Pianobar exited: %v\n", err)
-    }
-    stopRecording(true) // Delete on exit (e.g., 'q')
+    <-inputDone // Ensure input goroutine is done
+    stopRecording(true)
     if termState != nil {
         term.Restore(int(os.Stdin.Fd()), termState)
     }
@@ -316,7 +472,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
                 mu.Unlock()
                 return
             }
-            if time.Since(start) < minRecordTime { // Skip check early in recording
+            if time.Since(start) < minRecordTime {
                 mu.Unlock()
                 continue
             }
@@ -325,7 +481,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
                 currentSize := info.Size()
                 if currentSize == lastSize && currentSize > 1024*50 {
                     silenceCount++
-                    if silenceCount >= 2 { // Require 2 consecutive checks (30s total)
+                    if silenceCount >= 2 {
                         mu.Lock()
                         if cmd == ffmpegCmd && recording {
                             fmt.Println("Detected prolonged silence (possible sleep), stopping recording")
@@ -335,7 +491,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
                         return
                     }
                 } else {
-                    silenceCount = 0 // Reset if growing
+                    silenceCount = 0
                 }
                 lastSize = currentSize
             }
