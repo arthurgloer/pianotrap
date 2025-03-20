@@ -11,6 +11,7 @@ import (
     "strings"
     "sync"
     "syscall"
+    "time"
 
     "golang.org/x/term"
 )
@@ -21,6 +22,8 @@ const (
     configFileName    = "config"
     pianobarConfigDir = ".config/pianobar"
     eventCmdFileName  = "eventcmd.sh"
+    silenceThreshold  = 15 * time.Second // Longer threshold
+    minRecordTime     = 30 * time.Second // Minimum time before silence check
 )
 
 type Config struct {
@@ -156,7 +159,11 @@ func stopRecording(deleteFile bool) {
     defer mu.Unlock()
     if ffmpegCmd != nil && recording {
         fmt.Println("Stopping current recording")
-        ffmpegCmd.Process.Kill()
+        ffmpegCmd.Process.Signal(syscall.SIGTERM) // Try graceful stop
+        time.Sleep(500 * time.Millisecond)        // Give it a moment
+        if err := ffmpegCmd.Process.Kill(); err != nil {
+            fmt.Fprintf(os.Stderr, "Warning: failed to kill ffmpeg: %v\n", err)
+        }
         if deleteFile && currentFileName != "" {
             fmt.Printf("Removing incomplete file: %s\n", currentFileName)
             os.Remove(currentFileName)
@@ -195,12 +202,12 @@ func RunPianotrap(cfg Config) error {
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     go func() {
         <-sigChan
-        stopRecording(true) // Delete on Ctrl+C
-        pianobarCmd.Process.Kill()
         if termState != nil {
             term.Restore(int(os.Stdin.Fd()), termState)
         }
-        os.Exit(1)
+        stopRecording(true) // Delete on Ctrl+C
+        pianobarCmd.Process.Kill()
+        os.Exit(0) // Clean exit
     }()
 
     scanner := bufio.NewScanner(pianobarOut)
@@ -245,12 +252,10 @@ func RunPianotrap(cfg Config) error {
             stopRecording(false) // Keep file on natural finish
         }
 
-        // Detect skip ('n') or pause ('p') from user input prompt
         if strings.Contains(line, "[?]") && (strings.Contains(line, "n") || strings.Contains(line, "p")) {
             stopRecording(true) // Delete on skip or pause
         }
 
-        // Detect connection issues
         if strings.Contains(line, "(i) Network error") || strings.Contains(line, "Connection lost") {
             stopRecording(true) // Delete on connection issues
         }
@@ -291,6 +296,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
     ffmpegCmd.Stdout = nil
     errPipe, _ := ffmpegCmd.StderrPipe()
     errScanner := bufio.NewScanner(errPipe)
+    startTime := time.Now()
     mu.Unlock()
 
     fmt.Printf("Starting ffmpeg for %s\n", fileName)
@@ -299,6 +305,43 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
         return
     }
 
+    go func(cmd *exec.Cmd, file string, start time.Time) {
+        ticker := time.NewTicker(silenceThreshold)
+        defer ticker.Stop()
+        var lastSize int64
+        silenceCount := 0
+        for range ticker.C {
+            mu.Lock()
+            if cmd != ffmpegCmd || !recording {
+                mu.Unlock()
+                return
+            }
+            if time.Since(start) < minRecordTime { // Skip check early in recording
+                mu.Unlock()
+                continue
+            }
+            mu.Unlock()
+            if info, err := os.Stat(file); err == nil {
+                currentSize := info.Size()
+                if currentSize == lastSize && currentSize > 1024*50 {
+                    silenceCount++
+                    if silenceCount >= 2 { // Require 2 consecutive checks (30s total)
+                        mu.Lock()
+                        if cmd == ffmpegCmd && recording {
+                            fmt.Println("Detected prolonged silence (possible sleep), stopping recording")
+                            stopRecording(true)
+                        }
+                        mu.Unlock()
+                        return
+                    }
+                } else {
+                    silenceCount = 0 // Reset if growing
+                }
+                lastSize = currentSize
+            }
+        }
+    }(ffmpegCmd, fileName, startTime)
+
     go func(cmd *exec.Cmd) {
         var errOutput strings.Builder
         for errScanner.Scan() {
@@ -306,7 +349,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
         }
         mu.Lock()
         defer mu.Unlock()
-        if cmd != ffmpegCmd { // Command was replaced or killed
+        if cmd != ffmpegCmd {
             return
         }
         if err := cmd.Wait(); err != nil && !strings.Contains(err.Error(), "signal") {
