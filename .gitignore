@@ -1,0 +1,39 @@
+# Binaries for programs and plugins
+pianotrap
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Temporary files
+*.log
+/tmp/*
+*.tmp
+
+# Go-specific build artifacts
+*.test
+*.prof
+/bin/
+/pkg/
+
+# Dependency directories (if not using modules, but we are, so this is optional)
+/vendor/
+
+# Editor and IDE files
+*.swp
+*.swo
+.vscode/
+.idea/
+*.sublime-workspace
+
+# macOS-specific
+.DS_Store
+
+# Local config files (if any)
+*.local
+*.bak
+
+# Debug or test outputs
+debug/
+output/
