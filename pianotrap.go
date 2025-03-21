@@ -32,7 +32,6 @@ type Config struct {
     SaveDir string
 }
 
-// Restore original globals
 var (
     currentStation  string
     currentFileName string
@@ -41,9 +40,9 @@ var (
     remainingTime   time.Duration
     totalDuration   time.Duration
     mu              sync.Mutex
+    pianobarSinkID  string
 )
 
-// parseTime converts "MM:SS" to time.Duration
 func parseTime(timeStr string) (time.Duration, error) {
     parts := strings.Split(timeStr, ":")
     if len(parts) != 2 {
@@ -60,19 +59,18 @@ func parseTime(timeStr string) (time.Duration, error) {
     return minutes + seconds, nil
 }
 
-// Original stopRecording function
 func stopRecording(deleteFile bool) {
     mu.Lock()
     defer mu.Unlock()
     if ffmpegCmd != nil && recording {
-        fmt.Println("Stopping current recording")
+        fmt.Printf("\r\nStopping current recording\n")
         ffmpegCmd.Process.Signal(syscall.SIGTERM)
         time.Sleep(500 * time.Millisecond)
         if err := ffmpegCmd.Process.Kill(); err != nil {
-            fmt.Fprintf(os.Stderr, "Warning: failed to kill ffmpeg: %v\n", err)
+            fmt.Fprintf(os.Stderr, "\r\nWarning: failed to kill ffmpeg: %v\n", err)
         }
         if deleteFile && currentFileName != "" {
-            fmt.Printf("Removing incomplete file: %s\n", currentFileName)
+            fmt.Printf("\r\nRemoving incomplete file: %s\n", currentFileName)
             os.Remove(currentFileName)
         }
         recording = false
@@ -80,6 +78,60 @@ func stopRecording(deleteFile bool) {
     }
     remainingTime = 0
     totalDuration = 0
+}
+
+func setupPianobarSink() (string, error) {
+    // Get the default sink (speakers)
+    cmd := exec.Command("pactl", "get-default-sink")
+    defaultSink, err := cmd.Output()
+    if err != nil {
+        return "", fmt.Errorf("failed to get default sink: %v", err)
+    }
+    defaultSinkName := strings.TrimSpace(string(defaultSink))
+    fmt.Printf("\r\nDefault sink (speakers): %s\n", defaultSinkName)
+
+    // Create a null sink for recording Pianobar audio
+    cmd = exec.Command("pactl", "load-module", "module-null-sink", "sink_name=PianobarSink", "sink_properties=device.description=PianobarSink")
+    output, err := cmd.Output()
+    if err != nil {
+        return "", fmt.Errorf("failed to create PianobarSink: %v", err)
+    }
+    pianobarSinkID = strings.TrimSpace(string(output))
+    fmt.Printf("\r\nCreated PianobarSink with module ID: %s\n", pianobarSinkID)
+
+    // Wait for Pianobar to start (called later in RunPianotrap)
+    // We'll move its sink input to the default sink and loop it to PianobarSink after Pianobar is running
+
+    // Set up a loopback from default sink monitor to PianobarSink
+    cmd = exec.Command("pactl", "load-module", "module-loopback", "sink=PianobarSink", "source="+defaultSinkName+".monitor")
+    loopbackID, err := cmd.Output()
+    if err != nil {
+        return "", fmt.Errorf("failed to create loopback to PianobarSink: %v", err)
+    }
+    fmt.Printf("\r\nCreated loopback with ID %s from %s.monitor to PianobarSink\n", strings.TrimSpace(string(loopbackID)), defaultSinkName)
+
+    // Ensure PianobarSink is unmuted and audible
+    cmd = exec.Command("pactl", "set-sink-mute", "PianobarSink", "0")
+    if err := cmd.Run(); err != nil {
+        fmt.Fprintf(os.Stderr, "\r\nWarning: failed to unmute PianobarSink: %v\n", err)
+    }
+    cmd = exec.Command("pactl", "set-sink-volume", "PianobarSink", "100%")
+    if err := cmd.Run(); err != nil {
+        fmt.Fprintf(os.Stderr, "\r\nWarning: failed to set PianobarSink volume: %v\n", err)
+    }
+
+    return "PianobarSink.monitor", nil
+}
+
+func cleanupPianobarSink() {
+    if pianobarSinkID != "" {
+        cmd := exec.Command("pactl", "unload-module", pianobarSinkID)
+        if err := cmd.Run(); err != nil {
+            fmt.Fprintf(os.Stderr, "\r\nWarning: failed to unload PianobarSink module %s: %v\n", pianobarSinkID, err)
+        } else {
+            fmt.Printf("\r\nUnloaded PianobarSink module %s\n", pianobarSinkID)
+        }
+    }
 }
 
 func LoadConfig() (Config, error) {
@@ -227,23 +279,21 @@ func cleanLine(line string, width int) string {
 }
 
 func RunPianotrap(cfg Config) error {
-    monitorSource, err := getPulseMonitorSource()
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "\r\nWarning: could not determine PulseAudio monitor source: %v\nFalling back to 'default.monitor'\n", err)
-        monitorSource = "default.monitor"
-    }
+    // Use PianobarSink.monitor as the recording source
+    monitorSource := "PianobarSink.monitor"
     fmt.Printf("\r\nUsing PulseAudio monitor source: %s\n", monitorSource)
 
-    pianobarCmd := exec.Command("pianobar")
+    // Launch the shell script
+    pianobarCmd := exec.Command("./launch_pianobar.sh")
     ptyFile, err := pty.Start(pianobarCmd)
     if err != nil {
-        return fmt.Errorf("error starting pianobar in PTY: %v", err)
+        return fmt.Errorf("error starting pianobar script in PTY: %v", err)
     }
     defer ptyFile.Close()
 
-    _, err2 := term.GetState(int(os.Stdin.Fd()))
-    if err2 != nil {
-        fmt.Fprintf(os.Stderr, "\r\nWarning: could not save terminal state: %v\n", err2)
+    _, err = term.GetState(int(os.Stdin.Fd()))
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "\r\nWarning: could not save terminal state: %v\n", err)
     }
 
     oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
@@ -270,7 +320,7 @@ func RunPianotrap(cfg Config) error {
 
     go func() {
         if err := pianobarCmd.Wait(); err != nil {
-            fmt.Fprintf(os.Stderr, "\r\nPianobar exited with error: %v\n", err)
+            fmt.Fprintf(os.Stderr, "\r\nPianobar script exited with error: %v\n", err)
         }
         closeDone()
     }()
@@ -290,7 +340,7 @@ func RunPianotrap(cfg Config) error {
                 n, err := os.Stdin.Read(buf)
                 if err != nil {
                     if err.Error() != "EOF" {
-                        fmt.Fprintf(os.Stderr, "\r\n\r\nError reading from stdin: %v\n", err)
+                        fmt.Fprintf(os.Stderr, "\r\nError reading from stdin: %v\n", err)
                     }
                     return
                 }
@@ -300,7 +350,7 @@ func RunPianotrap(cfg Config) error {
                     return
                 }
                 if strings.Contains(string(buf[:n]), "q") {
-                    stopRecording(true) // Stop and delete current recording
+                    stopRecording(true)
                     pianobarCmd.Process.Signal(syscall.SIGTERM)
                     time.Sleep(500 * time.Millisecond)
                     pianobarCmd.Process.Kill()
@@ -315,7 +365,7 @@ func RunPianotrap(cfg Config) error {
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     go func() {
         <-sigChan
-        stopRecording(true) // Stop and delete current recording
+        stopRecording(true)
         pianobarCmd.Process.Signal(syscall.SIGTERM)
         time.Sleep(500 * time.Millisecond)
         pianobarCmd.Process.Kill()
@@ -381,7 +431,7 @@ loop:
                 newStation := sanitizeFileName(matches[1])
                 fmt.Fprintf(os.Stderr, "\r\nStation detected: %s\n", newStation)
                 if newStation != currentStation {
-                    stopRecording(true) // Delete incomplete file on station change
+                    stopRecording(true)
                     currentStation = newStation
                     stationDir := filepath.Join(cfg.SaveDir, currentStation)
                     if err := os.MkdirAll(stationDir, 0755); err != nil {
@@ -425,14 +475,14 @@ loop:
                     mu.Lock()
                     deleteFile := recording && totalDuration > 0 && remainingTime > timeThreshold
                     mu.Unlock()
-                    stopRecording(deleteFile) // Delete if incomplete
+                    stopRecording(deleteFile)
                     if currentStation == "" {
                         currentStation = "Unknown Station"
                     }
                     fmt.Fprintf(os.Stderr, "\r\nSaving with station: %s\n", currentStation)
                     currentFileName = filepath.Join(cfg.SaveDir, currentStation, sanitizeFileName(fmt.Sprintf("%s - %s.mp3", songTitle, artist)))
                     fmt.Printf("\r\nSong detected - Starting to save: %s\n", currentFileName)
-                    ffmpegCmd = exec.Command("ffmpeg", "-f", "pulse", "-i", monitorSource, "-af", "volume=2", "-acodec", "mp3", "-y", currentFileName)
+                    ffmpegCmd = exec.Command("ffmpeg", "-f", "pulse", "-i", monitorSource, "-acodec", "mp3", "-y", currentFileName)
                     recording = true
                     go saveSong(cfg, currentFileName, monitorSource)
                     lastSong = currentSong
@@ -440,18 +490,17 @@ loop:
             }
 
             if strings.HasPrefix(line, "SONGFINISH") && recording {
-                fmt.Printf("\r\nSong finished, stopping capture")
-                stopRecording(false) // Don’t delete completed song
+                fmt.Printf("\r\nSong finished, stopping capture\n")
+                stopRecording(false)
             }
 
             if strings.Contains(line, "(i) Network error") || strings.Contains(line, "Connection lost") {
-                stopRecording(true) // Delete on network issues
+                stopRecording(true)
                 lastSong = ""
             }
 
-            // Detect pause (assuming Pianobar outputs "(i) Song paused" or similar)
             if strings.Contains(line, "Song paused") {
-                stopRecording(true) // Delete on pause
+                stopRecording(true)
             }
         }
     }
@@ -476,12 +525,8 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
         return
     }
 
-    if err := exec.Command("pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%").Run(); err != nil {
-        fmt.Fprintf(os.Stderr, "\r\nError setting volume: %v\n", err)
-    }
-
     mu.Lock()
-    cmd := ffmpegCmd // Capture the current ffmpegCmd
+    cmd := ffmpegCmd
     cmd.Stdout = nil
     errPipe, _ := cmd.StderrPipe()
     errScanner := bufio.NewScanner(errPipe)
@@ -517,7 +562,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
                     if silenceCount >= 2 {
                         mu.Lock()
                         if cmd == ffmpegCmd && recording {
-                            fmt.Printf("\r\nDetected prolonged silence (possible sleep), stopping recording")
+                            fmt.Printf("\r\nDetected prolonged silence (possible sleep), stopping recording\n")
                             stopRecording(true)
                         }
                         mu.Unlock()
@@ -542,7 +587,7 @@ func saveSong(cfg Config, fileName string, monitorSource string) {
             return
         }
         if err := cmd.Wait(); err != nil && !strings.Contains(err.Error(), "signal") {
-            fmt.Fprintf(os.Stderr, "\r\nError capturing audio for %s: %v\n%s", fileName, err, errOutput.String())
+            fmt.Fprintf(os.Stderr, "\r\nError capturing audio for %s: %v\n%s\n", fileName, err, errOutput.String())
             os.Remove(fileName)
             return
         }
