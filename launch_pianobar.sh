@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Get the current default sink (speakers)
 ORIGINAL_SINK=$(pactl get-default-sink)
 if [ -z "$ORIGINAL_SINK" ]; then
     echo "Error: Could not determine original default sink" >&2
@@ -8,7 +7,6 @@ if [ -z "$ORIGINAL_SINK" ]; then
 fi
 echo "Original default sink: $ORIGINAL_SINK"
 
-# Create a null sink for Pianobar
 PIANOBAR_SINK_ID=$(pactl load-module module-null-sink sink_name=PianobarSink sink_properties=device.description=PianobarSink)
 if [ -z "$PIANOBAR_SINK_ID" ]; then
     echo "Error: Failed to create PianobarSink" >&2
@@ -16,28 +14,26 @@ if [ -z "$PIANOBAR_SINK_ID" ]; then
 fi
 echo "Created PianobarSink with module ID: $PIANOBAR_SINK_ID"
 
-# Launch Pianobar with PULSE_SINK set to PianobarSink
-PULSE_SINK=PianobarSink pianobar &
-PIANOBAR_PID=$!
-echo "Pianobar PID: $PIANOBAR_PID"
+pactl set-sink-volume PianobarSink 65536
+pactl set-sink-mute PianobarSink 0
 
-# Wait briefly for Pianobar to start
-sleep 1
-
-# Clone PianobarSink.monitor to the original sink for speaker playback
-LOOPBACK_ID=$(pactl load-module module-loopback sink="$ORIGINAL_SINK" source=PianobarSink.monitor)
+# Set loopback with explicit sample rate and low latency
+LOOPBACK_ID=$(pactl load-module module-loopback sink="$ORIGINAL_SINK" source=PianobarSink.monitor rate=44100 latency_msec=20)
 if [ -z "$LOOPBACK_ID" ]; then
     echo "Warning: Failed to create loopback to $ORIGINAL_SINK" >&2
 else
     echo "Created loopback with ID: $LOOPBACK_ID to $ORIGINAL_SINK"
 fi
 
-# Wait for Pianobar to exit
-wait $PIANOBAR_PID
+cleanup() {
+    pactl unload-module "$PIANOBAR_SINK_ID"
+    if [ ! -z "$LOOPBACK_ID" ]; then
+        pactl unload-module "$LOOPBACK_ID"
+    fi
+    echo "Cleaned up PianobarSink and loopback"
+    exit 0
+}
 
-# Cleanup
-pactl unload-module "$PIANOBAR_SINK_ID"
-if [ ! -z "$LOOPBACK_ID" ]; then
-    pactl unload-module "$LOOPBACK_ID"
-fi
-echo "Cleaned up PianobarSink and loopback"
+trap cleanup SIGTERM SIGINT
+
+PULSE_SINK=PianobarSink pianobar
