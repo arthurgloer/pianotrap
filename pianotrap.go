@@ -212,6 +212,7 @@ func RunPianotrap(cfg Config) error {
                     if matches := songRe.FindStringSubmatch(output); matches != nil {
                         songTitle := matches[1]
                         artist := matches[2]
+                        album := matches[3]
                         currentSong := fmt.Sprintf("%s by %s", songTitle, artist)
                         if currentSong != lastSong {
                             logger.Printf("New song detected: %s at %v", currentSong, time.Now())
@@ -222,12 +223,13 @@ func RunPianotrap(cfg Config) error {
                             if currentStation == "" {
                                 currentStation = "Unknown Station"
                             }
-                            currentFileName = filepath.Join(cfg.SaveDir, currentStation, sanitizeFileName(fmt.Sprintf("%s - %s.mp3", songTitle, artist)))
+                            defaultYear := time.Now().Year()
+                            currentFileName = filepath.Join(cfg.SaveDir, currentStation, sanitizeFileName(fmt.Sprintf("%s - %s - %s (%d).mp3", songTitle, artist, album, defaultYear)))
                             fmt.Printf("\r\nSong detected - Starting to save: %s\n", currentFileName)
                             mu.Lock()
                             recording = true
                             mu.Unlock()
-                            go saveSong(cfg, currentFileName, monitorSource)
+                            go saveSong(cfg, currentFileName, monitorSource, songTitle, artist, album, fmt.Sprintf("%d", defaultYear))
                             lastSong = currentSong
                         } else {
                             logger.Printf("Duplicate song skipped: %s at %v", currentSong, time.Now())
@@ -358,16 +360,38 @@ func stopRecording(deleteFile bool) {
     totalDuration = 0
 }
 
-func saveSong(cfg Config, fileName, monitorSource string) {
-    logger.Printf("Starting FFmpeg for %s with 15-minute timeout", fileName)
+func saveSong(cfg Config, fileName, monitorSource, songTitle, artist, album, year string) {
+    logger.Printf("Starting saveSong for %s", fileName)
+
     ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
     defer cancel()
 
+    if err := os.MkdirAll(filepath.Dir(fileName), 0755); err != nil {
+        logger.Printf("Failed to create directory for %s: %v", fileName, err)
+        return
+    }
+
+    ffmpegArgs := []string{
+        "-f", "pulse",
+        "-i", monitorSource,
+        "-acodec", "mp3",
+        "-y",
+        "-metadata", fmt.Sprintf("title=%s", songTitle),
+        "-metadata", fmt.Sprintf("artist=%s", artist),
+        "-metadata", fmt.Sprintf("album=%s", album),
+        "-metadata", fmt.Sprintf("date=%s", year),
+        fileName,
+    }
     mu.Lock()
-    ffmpegCmd = exec.CommandContext(ctx, "ffmpeg", "-f", "pulse", "-i", monitorSource, "-acodec", "mp3", "-y", fileName)
+    ffmpegCmd = exec.CommandContext(ctx, "ffmpeg", ffmpegArgs...)
+    ffmpegCmd.Stdout = logFile // Log FFmpeg output
+    ffmpegCmd.Stderr = logFile
     mu.Unlock()
-    if err := ffmpegCmd.Start(); err != nil {
-        logger.Printf("Error starting ffmpeg for %s: %v", fileName, err)
+    logger.Printf("FFmpeg command: %v", ffmpegArgs)
+
+    startErr := ffmpegCmd.Start()
+    if startErr != nil {
+        logger.Printf("Error starting FFmpeg for %s: %v", fileName, startErr)
         mu.Lock()
         ffmpegCmd = nil
         mu.Unlock()
@@ -376,21 +400,72 @@ func saveSong(cfg Config, fileName, monitorSource string) {
     pid := ffmpegCmd.Process.Pid
     logger.Printf("FFmpeg started, pid=%d", pid)
 
-    err := ffmpegCmd.Wait()
-    mu.Lock()
-    if ffmpegCmd != nil && ffmpegCmd.Process.Pid == pid {
-        ffmpegCmd = nil
-    }
-    mu.Unlock()
-    if err != nil {
-        if ctx.Err() == context.DeadlineExceeded {
-            logger.Printf("FFmpeg for %s timed out after 15 minutes, killed", fileName)
-        } else {
-            logger.Printf("Error running ffmpeg for %s: %v", fileName, err)
+    // Monitor FFmpeg progress
+    done := make(chan error, 1)
+    go func() {
+        err := ffmpegCmd.Wait()
+        done <- err
+    }()
+
+    select {
+    case err := <-done:
+        mu.Lock()
+        if ffmpegCmd != nil && ffmpegCmd.Process.Pid == pid {
+            ffmpegCmd = nil
         }
-    } else {
+        mu.Unlock()
+        if err != nil {
+            if ctx.Err() == context.DeadlineExceeded {
+                logger.Printf("FFmpeg for %s timed out after 15 minutes, killed", fileName)
+            } else {
+                logger.Printf("Error running FFmpeg for %s: %v", fileName, err)
+            }
+            return
+        }
         logger.Printf("FFmpeg completed for %s", fileName)
+    case <-time.After(15 * time.Minute):
+        logger.Printf("FFmpeg for %s did not complete within 15 minutes, forcing stop", fileName)
+        ffmpegCmd.Process.Kill()
+        mu.Lock()
+        ffmpegCmd = nil
+        mu.Unlock()
+        return
     }
+
+    // Post-processing for album art
+    logger.Printf("Starting post-processing for %s", fileName)
+    artFile := filepath.Join(os.TempDir(), sanitizeFileName(fmt.Sprintf("%s_%s.jpg", artist, album)))
+    sacadArgs := []string{artist, album, "600", artFile}
+    sacadCmd := exec.Command("sacad", sacadArgs...)
+    sacadCmd.Stdout = logFile
+    sacadCmd.Stderr = logFile
+    logger.Printf("Running sacad: %v", sacadArgs)
+    if err := sacadCmd.Run(); err != nil {
+        logger.Printf("Failed to fetch cover art with sacad for %s: %v", fileName, err)
+    } else if _, err := os.Stat(artFile); os.IsNotExist(err) {
+        logger.Printf("No cover art file created at %s", artFile)
+    } else {
+        logger.Printf("Fetched cover art to %s", artFile)
+        eyeD3Args := []string{
+            "--title", songTitle,
+            "--artist", artist,
+            "--album", album,
+            "--recording-date", year,
+            "--add-image", fmt.Sprintf("%s:FRONT_COVER", artFile),
+            fileName,
+        }
+        eyeD3Cmd := exec.Command("eyeD3", eyeD3Args...)
+        eyeD3Cmd.Stdout = logFile
+        eyeD3Cmd.Stderr = logFile
+        logger.Printf("Running eyeD3: %v", eyeD3Args)
+        if err := eyeD3Cmd.Run(); err != nil {
+            logger.Printf("Failed to embed metadata/art with eyeD3 for %s: %v", fileName, err)
+        } else {
+            logger.Printf("Successfully embedded metadata and art for %s", fileName)
+        }
+        os.Remove(artFile)
+    }
+    logger.Printf("Finished saveSong for %s", fileName)
 }
 
 func cleanExit(pianobarCmd *exec.Cmd, code int) {
