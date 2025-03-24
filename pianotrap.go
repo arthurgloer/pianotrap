@@ -134,7 +134,9 @@ func RunPianotrap(cfg Config) error {
                         if os.IsTimeout(err) {
                             logger.Printf("Write timeout, forcing shutdown")
                             stopRecording(true)
-                            pianobarCmd.Process.Kill()
+                            if ffmpegCmd != nil && ffmpegCmd.Process != nil {
+                                ffmpegCmd.Process.Kill()
+                            }
                             close(shutdown)
                         }
                         return
@@ -185,7 +187,9 @@ func RunPianotrap(cfg Config) error {
                             if time.Since(lastOutputTime) > 15*time.Second {
                                 logger.Printf("No PTY output for 15s, forcing stop at %v", time.Now())
                                 stopRecording(true)
-                                pianobarCmd.Process.Kill()
+                                if pianobarCmd != nil && pianobarCmd.Process != nil {
+                                    pianobarCmd.Process.Kill()
+                                }
                                 closeDone()
                             }
                         }
@@ -427,7 +431,9 @@ func saveSong(cfg Config, fileName, monitorSource, songTitle, artist, album, yea
         logger.Printf("FFmpeg completed for %s", fileName)
     case <-time.After(15 * time.Minute):
         logger.Printf("FFmpeg for %s did not complete within 15 minutes, forcing stop", fileName)
-        ffmpegCmd.Process.Kill()
+        if ffmpegCmd != nil && ffmpegCmd.Process != nil {
+            ffmpegCmd.Process.Kill()
+        }
         mu.Lock()
         ffmpegCmd = nil
         mu.Unlock()
@@ -472,7 +478,9 @@ func saveSong(cfg Config, fileName, monitorSource, songTitle, artist, album, yea
 
 func cleanExit(pianobarCmd *exec.Cmd, code int) {
     stopRecording(true)
-    pianobarCmd.Process.Kill()
+    if pianobarCmd != nil && pianobarCmd.Process != nil {
+        pianobarCmd.Process.Kill()
+    }
     if termState != nil {
         term.Restore(int(os.Stdin.Fd()), termState)
     }
