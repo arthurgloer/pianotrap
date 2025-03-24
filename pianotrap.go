@@ -327,9 +327,11 @@ func stopRecording(deleteFile bool) {
     if ffmpegCmd != nil {
         fmt.Printf("\r\nStopping current recording\n")
         pid := ffmpegCmd.Process.Pid
+        ffmpegCmd.Process.Signal(syscall.SIGTERM)
+        time.Sleep(500 * time.Millisecond)
         logger.Printf("Stopping FFmpeg for %s, pid=%d", currentFileName, pid)
         if err := ffmpegCmd.Process.Kill(); err != nil {
-            logger.Printf("Failed to kill FFmpeg pid %d: %v", pid, err)
+            fmt.Fprintf(os.Stderr, "\r\nWarning: failed to kill ffmpeg: %v\n", err)
         } else {
             logger.Printf("Killed FFmpeg pid %d", pid)
         }
