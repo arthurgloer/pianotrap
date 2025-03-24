@@ -4,6 +4,7 @@ import (
     "context"
     "flag"
     "fmt"
+    "io/ioutil"
     "log"
     "os"
     "os/exec"
@@ -38,12 +39,30 @@ type Config struct {
 }
 
 func main() {
-    saveDir := flag.String("savedir", "/home/arthur/Music", "directory to save recorded songs")
+    // Get the user's home directory
+    homeDir, err := os.UserHomeDir()
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Error getting home directory: %v\n", err)
+        os.Exit(1)
+    }
+    defaultSaveDir := filepath.Join(homeDir, "Music")
+
+    // Define the config file path
+    configFile := filepath.Join(homeDir, ".config", "pianotrap", "config")
+
+    // Load the save directory from the config file
+    saveDirFromConfig, err := loadSaveDir(configFile, defaultSaveDir)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Error with config file: %v\n", err)
+        os.Exit(1)
+    }
+
+    // Command-line flag overrides config file if provided
+    saveDir := flag.String("savedir", saveDirFromConfig, "directory to save recorded songs")
     logging := flag.Bool("log", false, "enable diagnostic logging to pianotrap.log")
     flag.Parse()
 
     if *logging {
-        var err error
         logFile, err = os.OpenFile("pianotrap.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
         if err != nil {
             fmt.Fprintf(os.Stderr, "Error opening log file: %v\n", err)
@@ -62,6 +81,50 @@ func main() {
         logger.Printf("Error running pianotrap: %v", err)
         os.Exit(1)
     }
+}
+
+// loadSaveDir reads or initializes the save directory from the config file in Pianobar style
+func loadSaveDir(configFile, defaultSaveDir string) (string, error) {
+    // Check if config file exists
+    if _, err := os.Stat(configFile); os.IsNotExist(err) {
+        // Create config directory and file with default value
+        if err := os.MkdirAll(filepath.Dir(configFile), 0755); err != nil {
+            return "", fmt.Errorf("failed to create config directory: %v", err)
+        }
+        configContent := fmt.Sprintf("savedir = %s\n", defaultSaveDir)
+        if err := ioutil.WriteFile(configFile, []byte(configContent), 0644); err != nil {
+            return "", fmt.Errorf("failed to write config file: %v", err)
+        }
+        return defaultSaveDir, nil
+    }
+
+    // Read and parse the config file
+    data, err := ioutil.ReadFile(configFile)
+    if err != nil {
+        return "", fmt.Errorf("failed to read config file: %v", err)
+    }
+
+    lines := strings.Split(string(data), "\n")
+    for _, line := range lines {
+        line = strings.TrimSpace(line)
+        if strings.HasPrefix(line, "savedir =") {
+            parts := strings.SplitN(line, "=", 2)
+            if len(parts) != 2 {
+                continue
+            }
+            saveDir := strings.TrimSpace(parts[1])
+            if saveDir != "" {
+                return saveDir, nil
+            }
+        }
+    }
+
+    // If savedir isn't found, append it to the existing file
+    configContent := string(data) + fmt.Sprintf("savedir = %s\n", defaultSaveDir)
+    if err := ioutil.WriteFile(configFile, []byte(configContent), 0644); err != nil {
+        return "", fmt.Errorf("failed to update config file with default savedir: %v", err)
+    }
+    return defaultSaveDir, nil
 }
 
 func RunPianotrap(cfg Config) error {
@@ -416,7 +479,7 @@ func saveSong(cfg Config, fileName, monitorSource, songTitle, artist, album, yea
     select {
     case err := <-done:
         mu.Lock()
-        if ffmpegCmd != nil && ffmpegCmd.Process.Pid == pid {
+        if ffmpegCmd != nil && ffmpegCmd.Process != nil && ffmpegCmd.Process.Pid == pid {
             ffmpegCmd = nil
         }
         mu.Unlock()
@@ -431,49 +494,14 @@ func saveSong(cfg Config, fileName, monitorSource, songTitle, artist, album, yea
         logger.Printf("FFmpeg completed for %s", fileName)
     case <-time.After(15 * time.Minute):
         logger.Printf("FFmpeg for %s did not complete within 15 minutes, forcing stop", fileName)
+        mu.Lock()
         if ffmpegCmd != nil && ffmpegCmd.Process != nil {
             ffmpegCmd.Process.Kill()
         }
-        mu.Lock()
         ffmpegCmd = nil
         mu.Unlock()
         return
     }
-
-    // Post-processing for album art
-    logger.Printf("Starting post-processing for %s", fileName)
-    artFile := filepath.Join(os.TempDir(), sanitizeFileName(fmt.Sprintf("%s_%s.jpg", artist, album)))
-    sacadArgs := []string{artist, album, "600", artFile}
-    sacadCmd := exec.Command("sacad", sacadArgs...)
-    sacadCmd.Stdout = logFile
-    sacadCmd.Stderr = logFile
-    logger.Printf("Running sacad: %v", sacadArgs)
-    if err := sacadCmd.Run(); err != nil {
-        logger.Printf("Failed to fetch cover art with sacad for %s: %v", fileName, err)
-    } else if _, err := os.Stat(artFile); os.IsNotExist(err) {
-        logger.Printf("No cover art file created at %s", artFile)
-    } else {
-        logger.Printf("Fetched cover art to %s", artFile)
-        eyeD3Args := []string{
-            "--title", songTitle,
-            "--artist", artist,
-            "--album", album,
-            "--recording-date", year,
-            "--add-image", fmt.Sprintf("%s:FRONT_COVER", artFile),
-            fileName,
-        }
-        eyeD3Cmd := exec.Command("eyeD3", eyeD3Args...)
-        eyeD3Cmd.Stdout = logFile
-        eyeD3Cmd.Stderr = logFile
-        logger.Printf("Running eyeD3: %v", eyeD3Args)
-        if err := eyeD3Cmd.Run(); err != nil {
-            logger.Printf("Failed to embed metadata/art with eyeD3 for %s: %v", fileName, err)
-        } else {
-            logger.Printf("Successfully embedded metadata and art for %s", fileName)
-        }
-        os.Remove(artFile)
-    }
-    logger.Printf("Finished saveSong for %s", fileName)
 }
 
 func cleanExit(pianobarCmd *exec.Cmd, code int) {
